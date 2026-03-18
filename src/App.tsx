@@ -20,6 +20,7 @@ import type {
 
 type Page = "dashboard" | "history" | "settings";
 type SettingsTab = "general" | "logs";
+type FileTargetNameMode = "auto" | "manual";
 
 const emptySettings: AppSettings = {
   launchOnStartup: false,
@@ -50,6 +51,9 @@ function App() {
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(emptySettings);
   const [ruleDraft, setRuleDraft] = useState<RuleDraft>(createEmptyDraft(emptySettings));
+  const [fileTargetDirectory, setFileTargetDirectory] = useState("");
+  const [fileTargetFileName, setFileTargetFileName] = useState("");
+  const [fileTargetNameMode, setFileTargetNameMode] = useState<FileTargetNameMode>("auto");
   const [logs, setLogs] = useState<AppLogEntry[]>([]);
   const [logPath, setLogPath] = useState("");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
@@ -70,8 +74,21 @@ function App() {
     if (ruleDraft.kind !== "file") {
       return null;
     }
-    return describeFileTargetPath(ruleDraft.targetPath);
-  }, [ruleDraft.kind, ruleDraft.targetPath]);
+    return describeFileTargetPath(composeFileTargetPath(fileTargetDirectory, fileTargetFileName));
+  }, [fileTargetDirectory, fileTargetFileName, ruleDraft.kind]);
+  const fileRuleCanSave =
+    ruleDraft.kind !== "file" ||
+    (ruleDraft.sourcePath.trim().length > 0 &&
+      fileTargetDirectory.trim().length > 0 &&
+      fileTargetFileName.trim().length > 0);
+  const canSaveRule =
+    ruleDraft.name.trim().length > 0 &&
+    ruleDraft.sourcePath.trim().length > 0 &&
+    (ruleDraft.kind === "folder" ? ruleDraft.targetPath.trim().length > 0 : fileRuleCanSave);
+  const fileTargetNeedsSourceHint =
+    ruleDraft.kind === "file" &&
+    fileTargetDirectory.trim().length > 0 &&
+    fileTargetFileName.trim().length === 0;
 
   const sortedRules = useMemo(
     () =>
@@ -95,14 +112,14 @@ function App() {
   }, [page, settingsTab]);
 
   useEffect(() => {
-    if (isRuleModalOpen || cleanupPreview) {
+    if (isRuleModalOpen || cleanupPreview || settingsDirty) {
       return;
     }
     const timer = window.setInterval(() => {
       void refreshSnapshotSilently();
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [cleanupPreview, isRuleModalOpen]);
+  }, [cleanupPreview, isRuleModalOpen, settingsDirty]);
 
   async function invokeSnapshot<T>(command: string, payload?: Record<string, unknown>) {
     return invoke<T>(command, payload);
@@ -189,10 +206,23 @@ function App() {
   function openCreateRuleModal() {
     setEditingRuleId(null);
     setRuleDraft(createEmptyDraft(snapshot?.settings ?? emptySettings));
+    setFileTargetDirectory("");
+    setFileTargetFileName("");
+    setFileTargetNameMode("auto");
     setIsRuleModalOpen(true);
   }
 
   function openEditRuleModal(rule: SyncRule) {
+    if (rule.kind === "file") {
+      const parts = splitTargetFilePath(rule.targetPath);
+      setFileTargetDirectory(parts.directory);
+      setFileTargetFileName(parts.fileName);
+      setFileTargetNameMode(parts.fileName === getPathBaseName(rule.sourcePath) ? "auto" : "manual");
+    } else {
+      setFileTargetDirectory("");
+      setFileTargetFileName("");
+      setFileTargetNameMode("auto");
+    }
     setEditingRuleId(rule.id);
     setRuleDraft({
       name: rule.name,
@@ -216,16 +246,24 @@ function App() {
       directory: kind === "folder",
     });
     if (typeof selected === "string") {
-      setRuleDraft((current) => ({ ...current, sourcePath: selected }));
+      applySourcePath(selected, kind);
     }
   }
 
   async function pickTargetFilePath() {
     const selected = await save({
-      defaultPath: ruleDraft.targetPath || undefined,
+      defaultPath:
+        ruleDraft.kind === "file"
+          ? composeFileTargetPath(fileTargetDirectory, fileTargetFileName) || undefined
+          : ruleDraft.targetPath || undefined,
     });
     if (selected) {
-      setRuleDraft((current) => ({ ...current, targetPath: selected }));
+      if (ruleDraft.kind === "file") {
+        const parts = splitTargetFilePath(selected);
+        applyFileTargetState(parts.directory, parts.fileName, "manual");
+      } else {
+        setRuleDraft((current) => ({ ...current, targetPath: selected }));
+      }
     }
   }
 
@@ -238,19 +276,33 @@ function App() {
       return;
     }
 
-    const nextTargetPath =
-      ruleDraft.kind === "file"
-        ? joinPath(selected, inferTargetFileName(ruleDraft))
-        : selected;
-    setRuleDraft((current) => ({ ...current, targetPath: nextTargetPath }));
+    if (ruleDraft.kind === "file") {
+      const nextFileName =
+        fileTargetNameMode === "auto" ? inferFileNameFromSource(ruleDraft.sourcePath) : fileTargetFileName;
+      applyFileTargetState(selected, nextFileName, fileTargetNameMode);
+      return;
+    }
+
+    setRuleDraft((current) => ({ ...current, targetPath: selected }));
   }
 
   async function handleSaveRule(event: FormEvent) {
     event.preventDefault();
+    if (!canSaveRule) {
+      flashStatus("请先补全规则名称、源路径和目标信息。", "error");
+      return;
+    }
     setBusyAction("save-rule");
 
     try {
-      const payload = sanitizeDraft(ruleDraft);
+      const payload = sanitizeDraft(
+        ruleDraft.kind === "file"
+          ? {
+              ...ruleDraft,
+              targetPath: composeFileTargetPath(fileTargetDirectory, fileTargetFileName),
+            }
+          : ruleDraft
+      );
       const nextSnapshot = editingRuleId
         ? await invokeSnapshot<AppStateSnapshot>("update_rule", {
             ruleId: editingRuleId,
@@ -398,27 +450,116 @@ function App() {
     event.preventDefault();
     setBusyAction("save-settings");
     try {
-      if (settingsDraft.launchOnStartup) {
-        await enable();
-      } else {
-        await disable();
+      let autostartError: string | null = null;
+      const beforeAutostart = await safeGetAutostartEnabled();
+      if (settingsDraft.launchOnStartup !== beforeAutostart) {
+        try {
+          if (settingsDraft.launchOnStartup) {
+            await enable();
+          } else {
+            await disable();
+          }
+        } catch (error) {
+          autostartError = formatError(error);
+        }
       }
 
       if (settingsDraft.showNotifications) {
         await ensureNotificationPermission();
       }
 
+      const actualAutostart = await safeGetAutostartEnabled();
       const nextSnapshot = await invokeSnapshot<AppStateSnapshot>("save_settings", {
-        settings: settingsDraft,
+        settings: {
+          ...settingsDraft,
+          launchOnStartup: actualAutostart,
+        },
       });
+      nextSnapshot.settings.launchOnStartup = actualAutostart;
       setSettingsDirty(false);
       applySnapshot(nextSnapshot);
-      flashStatus("设置已保存。", "success");
+      flashStatus(
+        autostartError
+          ? `设置已保存，但开机自启未生效：${autostartError}`
+          : "设置已保存。",
+        autostartError ? "error" : "success"
+      );
     } catch (error) {
       flashStatus(formatError(error), "error");
     } finally {
       setBusyAction(null);
     }
+  }
+
+  function applySourcePath(nextSourcePath: string, kind: RuleKind = ruleDraft.kind) {
+    if (kind === "file" && fileTargetNameMode === "auto") {
+      const nextFileName = inferFileNameFromSource(nextSourcePath);
+      setFileTargetFileName(nextFileName);
+      setRuleDraft((current) => ({
+        ...current,
+        sourcePath: nextSourcePath,
+        targetPath: composeFileTargetPath(fileTargetDirectory, nextFileName),
+      }));
+      return;
+    }
+
+    setRuleDraft((current) => ({
+      ...current,
+      sourcePath: nextSourcePath,
+    }));
+  }
+
+  function applyFileTargetState(
+    nextDirectory: string,
+    nextFileName: string,
+    nextMode: FileTargetNameMode
+  ) {
+    setFileTargetDirectory(nextDirectory);
+    setFileTargetFileName(nextFileName);
+    setFileTargetNameMode(nextMode);
+    setRuleDraft((current) => ({
+      ...current,
+      targetPath: composeFileTargetPath(nextDirectory, nextFileName),
+    }));
+  }
+
+  function handleFileTargetDirectoryChange(value: string) {
+    applyFileTargetState(value, fileTargetFileName, fileTargetNameMode);
+  }
+
+  function handleFileTargetFileNameChange(value: string) {
+    applyFileTargetState(fileTargetDirectory, value, "manual");
+  }
+
+  function handleFollowSourceFileName() {
+    const nextFileName = inferFileNameFromSource(ruleDraft.sourcePath);
+    applyFileTargetState(fileTargetDirectory, nextFileName, "auto");
+  }
+
+  function handleRuleKindChange(nextKind: RuleKind) {
+    if (nextKind === ruleDraft.kind) {
+      return;
+    }
+
+    if (nextKind === "file") {
+      const nextDirectory = ruleDraft.kind === "folder" ? ruleDraft.targetPath.trim() : fileTargetDirectory;
+      const nextFileName =
+        fileTargetNameMode === "auto" ? inferFileNameFromSource(ruleDraft.sourcePath) : fileTargetFileName;
+      setFileTargetDirectory(nextDirectory);
+      setFileTargetFileName(nextFileName);
+      setRuleDraft((current) => ({
+        ...current,
+        kind: "file",
+        targetPath: composeFileTargetPath(nextDirectory, nextFileName),
+      }));
+      return;
+    }
+
+    setRuleDraft((current) => ({
+      ...current,
+      kind: "folder",
+      targetPath: fileTargetDirectory.trim() || getPathDirName(current.targetPath) || "",
+    }));
   }
 
   async function handleTogglePause() {
@@ -958,26 +1099,14 @@ function App() {
                 <button
                   type="button"
                   className={ruleDraft.kind === "file" ? "segment active" : "segment"}
-                  onClick={() =>
-                    setRuleDraft((current) => ({
-                      ...current,
-                      kind: "file",
-                      targetPath: current.kind === "folder" ? "" : current.targetPath,
-                    }))
-                  }
+                  onClick={() => handleRuleKindChange("file")}
                 >
                   文件规则
                 </button>
                 <button
                   type="button"
                   className={ruleDraft.kind === "folder" ? "segment active" : "segment"}
-                  onClick={() =>
-                    setRuleDraft((current) => ({
-                      ...current,
-                      kind: "folder",
-                      targetPath: current.kind === "file" ? "" : current.targetPath,
-                    }))
-                  }
+                  onClick={() => handleRuleKindChange("folder")}
                 >
                   文件夹规则
                 </button>
@@ -990,10 +1119,7 @@ function App() {
                     value={ruleDraft.sourcePath}
                     onChange={(event) => {
                       const value = event.currentTarget.value;
-                      setRuleDraft((current) => ({
-                        ...current,
-                        sourcePath: value,
-                      }));
+                      applySourcePath(value);
                     }}
                     placeholder={ruleDraft.kind === "file" ? "选择现有源文件" : "选择现有源文件夹"}
                     required
@@ -1008,71 +1134,105 @@ function App() {
                 </div>
               </label>
 
-              <label className="field-group">
-                <span>目标路径</span>
-                <div className="path-input-group">
-                  <input
-                    value={ruleDraft.targetPath}
-                    onChange={(event) => {
-                      const value = event.currentTarget.value;
-                      setRuleDraft((current) => ({
-                        ...current,
-                        targetPath: value,
-                      }));
-                    }}
-                    placeholder={
-                      ruleDraft.kind === "file"
-                        ? "例如：E:\\project\\README.md"
-                        : "例如：E:\\project\\docs"
-                    }
-                    required
-                  />
-                  <div className="path-button-group">
-                    {ruleDraft.kind === "file" ? (
-                      <>
+              {ruleDraft.kind === "file" ? (
+                <div className="field-group">
+                  <span>目标路径</span>
+                  <div className="dual-field-grid">
+                    <label className="field-group">
+                      <span>目标目录</span>
+                      <div className="path-input-group">
+                        <input
+                          value={fileTargetDirectory}
+                          onChange={(event) => handleFileTargetDirectoryChange(event.currentTarget.value)}
+                          placeholder="例如：E:\\project\\docs"
+                          required
+                        />
                         <button
                           type="button"
                           className="secondary-button"
-                          onClick={() => void pickTargetFilePath()}
-                        >
-                          选文件
-                        </button>
-                        <button
-                          type="button"
-                          className="ghost-button"
                           onClick={() => void pickTargetDirectoryPath()}
                         >
                           选文件夹
                         </button>
-                      </>
-                    ) : (
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => void pickTargetDirectoryPath()}
-                      >
-                        选目录
-                      </button>
-                    )}
+                      </div>
+                    </label>
+
+                    <label className="field-group">
+                      <span>目标文件名</span>
+                      <div className="path-input-group">
+                        <input
+                          value={fileTargetFileName}
+                          onChange={(event) => handleFileTargetFileNameChange(event.currentTarget.value)}
+                          placeholder="例如：README.md"
+                          required
+                        />
+                        <div className="path-button-group">
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            onClick={handleFollowSourceFileName}
+                            disabled={!ruleDraft.sourcePath.trim()}
+                          >
+                            跟随源文件名
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            onClick={() => void pickTargetFilePath()}
+                          >
+                            选文件
+                          </button>
+                        </div>
+                      </div>
+                    </label>
                   </div>
+                  <small>允许目标先不存在，首次同步会自动创建缺失目录和目标文件。</small>
+                  {fileTargetNeedsSourceHint ? (
+                    <small className="inline-warning">请先选择源文件，或手动填写目标文件名。</small>
+                  ) : null}
+                  {draftTargetDetails ? (
+                    <div className="helper-note">
+                      <strong>当前会写入的目标文件</strong>
+                      <span>文件名：{draftTargetDetails.fileName || "未指定"}</span>
+                      <span>目录：{draftTargetDetails.directory || "未指定"}</span>
+                      <span>
+                        完整路径：
+                        {composeFileTargetPath(fileTargetDirectory, fileTargetFileName) || "未指定"}
+                      </span>
+                      <span>模式：{fileTargetNameMode === "auto" ? "自动跟随源文件名" : "手动指定文件名"}</span>
+                      {!draftTargetDetails.hasExtension && draftTargetDetails.fileName ? (
+                        <span>提示：当前文件名没有扩展名，首次同步会创建一个无扩展名文件。</span>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
-                <small>
-                  允许先不存在，首次同步会自动创建缺失目录和目标文件。
-                  {ruleDraft.kind === "file"
-                    ? " 也可以先选一个文件夹，程序会自动补上文件名。"
-                    : ""}
-                </small>
-                {draftTargetDetails ? (
-                  <div className="helper-note">
-                    <strong>当前会写入的目标文件</strong>
-                    <span>文件名：{draftTargetDetails.fileName || "未指定"}</span>
-                    <span>目录：{draftTargetDetails.directory || "未指定"}</span>
-                    {!draftTargetDetails.hasExtension ? (
-                      <span>提示：当前文件名没有扩展名，首次同步会创建一个无扩展名文件。</span>
-                    ) : null}
+              ) : (
+                <label className="field-group">
+                  <span>目标路径</span>
+                  <div className="path-input-group">
+                    <input
+                      value={ruleDraft.targetPath}
+                      onChange={(event) => {
+                        const value = event.currentTarget.value;
+                        setRuleDraft((current) => ({
+                          ...current,
+                          targetPath: value,
+                        }));
+                      }}
+                      placeholder="例如：E:\\project\\docs"
+                      required
+                    />
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void pickTargetDirectoryPath()}
+                    >
+                      选目录
+                    </button>
                   </div>
-                ) : null}
-              </label>
+                  <small>允许目标目录先不存在，首次同步会自动创建缺失目录。</small>
+                </label>
+              )}
 
               <div className="inline-grid">
                 <label className="toggle-card">
@@ -1189,7 +1349,7 @@ function App() {
                 <button type="button" className="ghost-button" onClick={() => setIsRuleModalOpen(false)}>
                   取消
                 </button>
-                <button className="primary-button" type="submit">
+                <button className="primary-button" type="submit" disabled={!canSaveRule}>
                   {busyAction === "save-rule" ? "保存中..." : editingRuleId ? "保存修改" : "创建规则"}
                 </button>
               </div>
@@ -1250,8 +1410,24 @@ function App() {
   );
 }
 
-function inferTargetFileName(draft: RuleDraft) {
-  return getPathBaseName(draft.sourcePath) || getPathBaseName(draft.targetPath) || "README.md";
+function inferFileNameFromSource(sourcePath: string) {
+  return getPathBaseName(sourcePath.trim());
+}
+
+function composeFileTargetPath(directory: string, fileName: string) {
+  const normalizedDirectory = directory.trim().replace(/[\\/]+$/, "");
+  const normalizedFileName = fileName.trim().replace(/^[\\/]+/, "");
+  if (normalizedDirectory && normalizedFileName) {
+    return joinPath(normalizedDirectory, normalizedFileName);
+  }
+  return normalizedDirectory || normalizedFileName;
+}
+
+function splitTargetFilePath(path: string) {
+  return {
+    directory: getPathDirName(path),
+    fileName: getPathBaseName(path),
+  };
 }
 
 function getPathBaseName(path: string) {

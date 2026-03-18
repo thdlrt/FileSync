@@ -516,6 +516,12 @@ button {
   gap: 14px;
 }
 
+.dual-field-grid {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 14px;
+}
+
 input,
 textarea {
   width: 100%;
@@ -559,6 +565,10 @@ textarea {
 
 .helper-note strong {
   color: #12373d;
+}
+
+.inline-warning {
+  color: #8a5a12;
 }
 
 .segmented {
@@ -754,7 +764,8 @@ textarea {
   .console-status,
   .rule-meta-grid,
   .inline-grid,
-  .settings-grid {
+  .settings-grid,
+  .dual-field-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -769,7 +780,8 @@ textarea {
   .console-status,
   .rule-meta-grid,
   .inline-grid,
-  .settings-grid {
+  .settings-grid,
+  .dual-field-grid {
     grid-template-columns: 1fr;
   }
 
