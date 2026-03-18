@@ -864,6 +864,107 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_file_does_not_create_backup() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("note.md");
+        let target = temp.path().join("project").join("README.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&source, "same-content").unwrap();
+        fs::write(&target, "same-content").unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "README".into(),
+            enabled: true,
+            kind: RuleKind::File,
+            source_path: source.to_string_lossy().to_string(),
+            target_path: target.to_string_lossy().to_string(),
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+        let rule = build_rule(None, draft, &settings).unwrap();
+
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        assert_eq!(outcome.last_result.backup_count, 0);
+        assert_eq!(outcome.last_result.skipped_count, 1);
+        assert!(!backup_root(&rule).unwrap().exists());
+    }
+
+    #[test]
+    fn changed_file_creates_backup_once() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("note.md");
+        let target = temp.path().join("project").join("README.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&source, "new-content").unwrap();
+        fs::write(&target, "old-content").unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "README".into(),
+            enabled: true,
+            kind: RuleKind::File,
+            source_path: source.to_string_lossy().to_string(),
+            target_path: target.to_string_lossy().to_string(),
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+        let rule = build_rule(None, draft, &settings).unwrap();
+
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        let backup_files = WalkDir::new(backup_root(&rule).unwrap())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+
+        assert_eq!(outcome.last_result.backup_count, 1);
+        assert_eq!(outcome.last_result.updated_count, 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new-content");
+        assert_eq!(backup_files, 1);
+    }
+
+    #[test]
+    fn unchanged_folder_file_does_not_create_backup() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("notes");
+        let target_root = temp.path().join("docs");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&target_root).unwrap();
+        fs::write(source_root.join("guide.md"), "same-folder-content").unwrap();
+        fs::write(target_root.join("guide.md"), "same-folder-content").unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "docs".into(),
+            enabled: true,
+            kind: RuleKind::Folder,
+            source_path: source_root.to_string_lossy().to_string(),
+            target_path: target_root.to_string_lossy().to_string(),
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+        let rule = build_rule(None, draft, &settings).unwrap();
+
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        assert_eq!(outcome.last_result.backup_count, 0);
+        assert_eq!(outcome.last_result.skipped_count, 1);
+        assert!(!backup_root(&rule).unwrap().exists());
+    }
+
+    #[test]
     fn file_rule_rejects_existing_directory_target() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("note.md");
