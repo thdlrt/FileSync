@@ -2,13 +2,19 @@ mod models;
 mod state;
 mod sync_engine;
 
-use crate::models::{AppLogEntry, AppSettings, AppStateSnapshot, CleanupPreview, RuleDraft, SyncRule};
+use crate::models::{
+    AppLogEntry, AppSettings, AppStateSnapshot, CleanupPreview, RuleDraft, SyncRule,
+};
 use crate::state::SharedState;
+use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use tauri::menu::MenuBuilder;
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State, WindowEvent};
+use tauri_plugin_autostart::ManagerExt;
+
+const AUTOSTART_ARG: &str = "--autostart";
 
 #[tauri::command]
 async fn get_app_state(state: State<'_, SharedState>) -> Result<AppStateSnapshot, String> {
@@ -177,6 +183,29 @@ fn reveal_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn launched_from_autostart() -> bool {
+    env::args().any(|arg| arg == AUTOSTART_ARG)
+}
+
+fn sync_autostart_registration(
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    let autostart = app.autolaunch();
+    let enabled = autostart.is_enabled().map_err(|error| error.to_string())?;
+
+    if settings.launch_on_startup {
+        if enabled {
+            autostart.disable().map_err(|error| error.to_string())?;
+        }
+        autostart.enable().map_err(|error| error.to_string())?;
+    } else if enabled {
+        autostart.disable().map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
         .text("show", "显示主窗口")
@@ -228,17 +257,33 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let launched_from_autostart = launched_from_autostart();
+
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|arg| arg == AUTOSTART_ARG) {
+                return;
+            }
             reveal_main_window(app);
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_ARG])
+                .app_name("FileSync Notes")
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
             let shared = SharedState::new(app.handle().clone())?;
             tauri::async_runtime::block_on(shared.initialize())?;
+            let settings = tauri::async_runtime::block_on(shared.get_settings())?;
+            if !tauri::is_dev() {
+                if let Err(error) = sync_autostart_registration(app.handle(), &settings) {
+                    eprintln!("failed to synchronize autostart registration: {error}");
+                }
+            }
             app.manage(shared);
             build_tray(app)?;
 
@@ -272,7 +317,7 @@ pub fn run() {
                 })
                 .unwrap_or(false);
 
-                if start_hidden {
+                if start_hidden || launched_from_autostart {
                     let _ = window.hide();
                 }
             }

@@ -1,11 +1,13 @@
 use crate::models::{
     AppSettings, CleanupCandidate, CleanupCandidateKind, CleanupPreview, ConflictPolicy,
-    DeletePolicy, RuleDraft, RuleHealth, RuleKind, RuleLastResult, SyncHistoryItem, SyncRule,
-    SyncTrigger,
+    DeletePolicy, RuleDraft, RuleHealth, RuleKind, RuleLastResult, RuleSyncState,
+    SyncHistoryItem, SyncRule, SyncTrigger,
 };
 use blake3::Hasher;
 use chrono::{DateTime, Duration, Utc};
+use filetime::{set_file_mtime, FileTime};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
@@ -29,6 +31,23 @@ pub struct RuleRunOutcome {
     pub history_item: SyncHistoryItem,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleSide {
+    Source,
+    Target,
+}
+
+impl RuleSide {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Source => Self::Target,
+            Self::Target => Self::Source,
+        }
+    }
+}
+
+const FILE_SYNC_ENTRY: &str = "__file__";
+
 struct Matcher {
     include: GlobSet,
     exclude: GlobSet,
@@ -45,10 +64,11 @@ pub fn build_rule(
     draft: RuleDraft,
     settings: &AppSettings,
 ) -> Result<SyncRule, String> {
-    let source_path = normalize_path(&draft.source_path)?;
+    let source_path = normalize_source_path(&draft.source_path)?;
     let target_path = normalize_target_path(&draft.target_path)?;
+    let delete_policy = default_delete_policy(draft.kind.clone(), draft.bidirectional);
 
-    validate_rule_paths(&draft.kind, &source_path, &target_path)?;
+    validate_rule_paths(&draft.kind, &source_path, &target_path, draft.bidirectional)?;
 
     Ok(SyncRule {
         id: rule_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
@@ -57,6 +77,7 @@ pub fn build_rule(
         kind: draft.kind,
         source_path,
         target_path,
+        bidirectional: draft.bidirectional,
         auto_sync: draft.auto_sync,
         watch_enabled: draft.watch_enabled,
         poll_fallback_enabled: draft.poll_fallback_enabled,
@@ -66,20 +87,67 @@ pub fn build_rule(
                 .min(draft.poll_interval_sec.max(5)),
         ),
         conflict_policy: ConflictPolicy::OverwriteWithBackup,
-        delete_policy: DeletePolicy::NoDelete,
+        delete_policy,
         include_globs: sanitize_globs(draft.include_globs),
         exclude_globs: sanitize_globs(draft.exclude_globs),
+        sync_state: RuleSyncState::default(),
         last_sync_at: None,
         last_result: RuleLastResult::default(),
         health: RuleHealth::Healthy,
+        config_error: None,
     })
 }
 
 pub fn evaluate_rule_health(rule: &SyncRule) -> RuleHealth {
+    if rule.config_error.is_some() {
+        return RuleHealth::InvalidConfiguration;
+    }
+
     let source = PathBuf::from(&rule.source_path);
     let target = PathBuf::from(&rule.target_path);
 
-    if !source.exists() {
+    if !source.is_absolute() || !target.is_absolute() {
+        return RuleHealth::InvalidTargetPath;
+    }
+
+    if source == target {
+        return RuleHealth::InvalidTargetPath;
+    }
+
+    let source_exists = source.exists();
+    let target_exists = target.exists();
+
+    if rule.bidirectional {
+        if !source_exists && !target_exists {
+            return RuleHealth::MissingSource;
+        }
+
+        match rule.kind {
+            RuleKind::File => {
+                if source_exists && !source.is_file() {
+                    return RuleHealth::InvalidSourceType;
+                }
+                if target_exists && target.is_dir() {
+                    return RuleHealth::InvalidTargetPath;
+                }
+            }
+            RuleKind::Folder => {
+                if source_exists && !source.is_dir() {
+                    return RuleHealth::InvalidSourceType;
+                }
+                if target_exists && target.is_file() {
+                    return RuleHealth::InvalidTargetPath;
+                }
+                if source_exists && target_exists && paths_overlap(&source, &target) {
+                    return RuleHealth::OverlappingDirectories;
+                }
+            }
+        }
+
+        return RuleHealth::Healthy;
+    }
+
+    if !source_exists {
         return RuleHealth::MissingSource;
     }
 
@@ -120,7 +188,7 @@ pub fn run_rule_sync(
             trigger,
             started_at,
             true,
-            success_message(&counts),
+            success_message(rule, &counts),
             counts,
         ),
         Err(error) => {
@@ -187,16 +255,21 @@ pub fn execute_rule_cleanup(rule: &SyncRule) -> Result<RuleRunOutcome, String> {
         if counts.deleted_count == 0 {
             "没有需要清理的备份。".to_string()
         } else {
-            format!("备份清理完成：删除 {} 个备份文件或目录。", counts.deleted_count)
+            format!(
+                "备份清理完成：删除 {} 个备份文件或目录。",
+                counts.deleted_count
+            )
         },
         counts,
     ))
 }
 
 fn sync_rule_files(rule: &SyncRule, settings: &AppSettings) -> Result<RunCounts, String> {
-    match rule.kind {
-        RuleKind::File => sync_single_file(rule, settings),
-        RuleKind::Folder => sync_folder(rule, settings),
+    match (rule.kind.clone(), rule.bidirectional) {
+        (RuleKind::File, false) => sync_single_file(rule, settings),
+        (RuleKind::Folder, false) => sync_folder(rule, settings),
+        (RuleKind::File, true) => sync_bidirectional_file(rule, settings),
+        (RuleKind::Folder, true) => sync_bidirectional_folder(rule, settings),
     }
 }
 
@@ -213,14 +286,13 @@ fn sync_single_file(rule: &SyncRule, settings: &AppSettings) -> Result<RunCounts
     } else if files_match(&source, &target)? {
         counts.skipped_count += 1;
     } else {
-        backup_target_file(rule, &target, None)?;
-        purge_expired_backups(rule, settings.backup_retention_days)?;
+        backup_rule_file(rule, RuleSide::Target, &target, None)?;
         copy_file_atomic(&source, &target)?;
         counts.updated_count += 1;
         counts.backup_count += 1;
     }
 
-    purge_expired_backups(rule, settings.backup_retention_days)?;
+    purge_expired_backups_for_rule(rule, settings.backup_retention_days)?;
     Ok(counts)
 }
 
@@ -228,24 +300,13 @@ fn sync_folder(rule: &SyncRule, settings: &AppSettings) -> Result<RunCounts, Str
     let source_root = PathBuf::from(&rule.source_path);
     let target_root = PathBuf::from(&rule.target_path);
     let matcher = build_matcher(rule)?;
+    let source_files = collect_folder_files(&source_root, &matcher)?;
     let mut counts = RunCounts::default();
 
     fs::create_dir_all(&target_root).map_err(to_error)?;
 
-    for entry in WalkDir::new(&source_root)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let source_path = entry.path();
-        if entry.file_type().is_dir() {
-            continue;
-        }
-
-        let relative_path = source_path.strip_prefix(&source_root).map_err(to_error)?;
-        if !matcher.matches(relative_path) {
-            continue;
-        }
-
+    for (relative, source_path) in &source_files {
+        let relative_path = Path::new(relative);
         let target_path = target_root.join(relative_path);
         ensure_parent_dir(&target_path)?;
 
@@ -260,14 +321,245 @@ fn sync_folder(rule: &SyncRule, settings: &AppSettings) -> Result<RunCounts, Str
             continue;
         }
 
-        backup_target_file(rule, &target_path, Some(relative_path))?;
+        backup_rule_file(rule, RuleSide::Target, &target_path, Some(relative_path))?;
         copy_file_atomic(source_path, &target_path)?;
         counts.updated_count += 1;
         counts.backup_count += 1;
     }
 
-    purge_expired_backups(rule, settings.backup_retention_days)?;
+    if matches!(rule.delete_policy, DeletePolicy::MoveToBackup) {
+        let target_files = collect_folder_files(&target_root, &matcher)?;
+        for (relative, target_path) in target_files {
+            if source_files.contains_key(&relative) {
+                continue;
+            }
+
+            let relative_path = PathBuf::from(&relative);
+            backup_rule_file(rule, RuleSide::Target, &target_path, Some(relative_path.as_path()))?;
+            let _ = clear_readonly(&target_path);
+            fs::remove_file(&target_path)
+                .map_err(|error| format_io_error("删除目标侧多余文件失败", &target_path, error))?;
+            counts.backup_count += 1;
+            counts.deleted_count += 1;
+        }
+
+        remove_empty_dirs(&target_root)?;
+    }
+
+    purge_expired_backups_for_rule(rule, settings.backup_retention_days)?;
     Ok(counts)
+}
+
+fn sync_bidirectional_file(rule: &SyncRule, settings: &AppSettings) -> Result<RunCounts, String> {
+    let source = PathBuf::from(&rule.source_path);
+    let target = PathBuf::from(&rule.target_path);
+    let mut counts = RunCounts::default();
+    let was_synced = rule
+        .sync_state
+        .mirrored_entries
+        .iter()
+        .any(|entry| entry == FILE_SYNC_ENTRY);
+
+    match (source.exists(), target.exists()) {
+        (false, false) => {
+            if was_synced {
+                counts.skipped_count += 1;
+            } else {
+                return Err("双向同步失败：源路径和目标路径都不存在。".to_string());
+            }
+        }
+        (true, false) => {
+            if was_synced {
+                delete_existing_file(rule, RuleSide::Source, &source, None, &mut counts)?;
+            } else {
+                copy_file_atomic(&source, &target)?;
+                counts.copied_count += 1;
+            }
+        }
+        (false, true) => {
+            if was_synced {
+                delete_existing_file(rule, RuleSide::Target, &target, None, &mut counts)?;
+            } else {
+                copy_file_atomic(&target, &source)?;
+                counts.copied_count += 1;
+            }
+        }
+        (true, true) => {
+            if !source.is_file() || !target.is_file() {
+                return Err("双向文件规则要求两侧都必须是文件。".to_string());
+            }
+
+            if files_match(&source, &target)? {
+                counts.skipped_count += 1;
+            } else {
+                let winner = newer_side_by_timestamp(&source, &target)?;
+                sync_file_pair(rule, winner, None, &mut counts)?;
+            }
+        }
+    }
+
+    purge_expired_backups_for_rule(rule, settings.backup_retention_days)?;
+    Ok(counts)
+}
+
+fn sync_bidirectional_folder(rule: &SyncRule, settings: &AppSettings) -> Result<RunCounts, String> {
+    let source_root = PathBuf::from(&rule.source_path);
+    let target_root = PathBuf::from(&rule.target_path);
+    let matcher = build_matcher(rule)?;
+    let source_files = collect_folder_files(&source_root, &matcher)?;
+    let target_files = collect_folder_files(&target_root, &matcher)?;
+    let mut counts = RunCounts::default();
+    let mirrored_entries = synced_entry_set(&rule.sync_state);
+
+    let relative_paths = source_files
+        .keys()
+        .chain(target_files.keys())
+        .chain(mirrored_entries.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for relative in relative_paths {
+        let relative_path = PathBuf::from(&relative);
+        match (source_files.get(&relative), target_files.get(&relative)) {
+            (Some(source_path), None) => {
+                if mirrored_entries.contains(&relative) {
+                    delete_existing_file(
+                        rule,
+                        RuleSide::Source,
+                        source_path,
+                        Some(relative_path.as_path()),
+                        &mut counts,
+                    )?;
+                } else {
+                    let target_path = target_root.join(&relative_path);
+                    copy_file_atomic(source_path, &target_path)?;
+                    counts.copied_count += 1;
+                }
+            }
+            (None, Some(target_path)) => {
+                if mirrored_entries.contains(&relative) {
+                    delete_existing_file(
+                        rule,
+                        RuleSide::Target,
+                        target_path,
+                        Some(relative_path.as_path()),
+                        &mut counts,
+                    )?;
+                } else {
+                    let source_path = source_root.join(&relative_path);
+                    copy_file_atomic(target_path, &source_path)?;
+                    counts.copied_count += 1;
+                }
+            }
+            (Some(source_path), Some(target_path)) => {
+                if files_match(source_path, target_path)? {
+                    counts.skipped_count += 1;
+                    continue;
+                }
+
+                let winner = newer_side_by_timestamp(source_path, target_path)?;
+                sync_file_pair(rule, winner, Some(relative_path.as_path()), &mut counts)?;
+            }
+            (None, None) => {
+                counts.skipped_count += 1;
+            }
+        }
+    }
+
+    remove_empty_dirs(&source_root)?;
+    remove_empty_dirs(&target_root)?;
+
+    purge_expired_backups_for_rule(rule, settings.backup_retention_days)?;
+    Ok(counts)
+}
+
+fn delete_existing_file(
+    rule: &SyncRule,
+    side: RuleSide,
+    file_path: &Path,
+    relative_path: Option<&Path>,
+    counts: &mut RunCounts,
+) -> Result<(), String> {
+    backup_rule_file(rule, side, file_path, relative_path)?;
+    let _ = clear_readonly(file_path);
+    fs::remove_file(file_path)
+        .map_err(|error| format_io_error("删除同步文件失败", file_path, error))?;
+    counts.backup_count += 1;
+    counts.deleted_count += 1;
+    Ok(())
+}
+
+fn sync_file_pair(
+    rule: &SyncRule,
+    winner: RuleSide,
+    relative_path: Option<&Path>,
+    counts: &mut RunCounts,
+) -> Result<(), String> {
+    let source_path = match (winner, relative_path) {
+        (RuleSide::Source, Some(relative)) => PathBuf::from(&rule.source_path).join(relative),
+        (RuleSide::Target, Some(relative)) => PathBuf::from(&rule.target_path).join(relative),
+        (RuleSide::Source, None) => PathBuf::from(&rule.source_path),
+        (RuleSide::Target, None) => PathBuf::from(&rule.target_path),
+    };
+    let target_side = winner.opposite();
+    let target_path = match (target_side, relative_path) {
+        (RuleSide::Source, Some(relative)) => PathBuf::from(&rule.source_path).join(relative),
+        (RuleSide::Target, Some(relative)) => PathBuf::from(&rule.target_path).join(relative),
+        (RuleSide::Source, None) => PathBuf::from(&rule.source_path),
+        (RuleSide::Target, None) => PathBuf::from(&rule.target_path),
+    };
+
+    if target_path.exists() {
+        backup_rule_file(rule, target_side, &target_path, relative_path)?;
+        counts.backup_count += 1;
+        counts.updated_count += 1;
+    } else {
+        counts.copied_count += 1;
+    }
+
+    copy_file_atomic(&source_path, &target_path)
+}
+
+fn collect_folder_files(root: &Path, matcher: &Matcher) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut files = BTreeMap::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
+        let relative_path = entry.path().strip_prefix(root).map_err(to_error)?;
+        if !matcher.matches(relative_path) {
+            continue;
+        }
+
+        files.insert(
+            normalize_relative(relative_path),
+            entry.path().to_path_buf(),
+        );
+    }
+
+    Ok(files)
+}
+
+fn newer_side_by_timestamp(source: &Path, target: &Path) -> Result<RuleSide, String> {
+    let source_modified = fs::metadata(source)
+        .map_err(to_error)?
+        .modified()
+        .map_err(to_error)?;
+    let target_modified = fs::metadata(target)
+        .map_err(to_error)?
+        .modified()
+        .map_err(to_error)?;
+
+    if target_modified > source_modified {
+        Ok(RuleSide::Target)
+    } else {
+        Ok(RuleSide::Source)
+    }
 }
 
 fn build_matcher(rule: &SyncRule) -> Result<Matcher, String> {
@@ -291,24 +583,26 @@ fn build_matcher(rule: &SyncRule) -> Result<Matcher, String> {
     })
 }
 
-fn backup_target_file(
+fn backup_rule_file(
     rule: &SyncRule,
-    target_file: &Path,
+    side: RuleSide,
+    file_path: &Path,
     relative: Option<&Path>,
 ) -> Result<(), String> {
-    if !target_file.exists() {
+    if !file_path.exists() {
         return Ok(());
     }
 
-    let backup_root = backup_root(rule)?;
+    let backup_root = backup_root_for_side(rule, side)?;
     let backup_path = match rule.kind {
         RuleKind::File => {
             fs::create_dir_all(&backup_root).map_err(to_error)?;
-            timestamped_file_name(&backup_root, target_file.file_name().unwrap_or_default())
+            timestamped_file_name(&backup_root, file_path.file_name().unwrap_or_default())
         }
         RuleKind::Folder => {
             let relative = relative.ok_or_else(|| "缺少目录规则的相对路径。".to_string())?;
-            let target_base = Path::new(&rule.target_path)
+            let side_root = path_for_side(rule, side);
+            let target_base = side_root
                 .file_name()
                 .ok_or_else(|| "目标目录无效，无法生成备份。".to_string())?;
             let base_dir = backup_root.join(target_base);
@@ -320,17 +614,31 @@ fn backup_target_file(
         }
     };
 
-    fs::copy(target_file, backup_path).map_err(to_error)?;
+    fs::copy(file_path, backup_path).map_err(to_error)?;
     Ok(())
 }
 
-fn purge_expired_backups(rule: &SyncRule, retention_days: u64) -> Result<(), String> {
+fn purge_expired_backups_for_rule(rule: &SyncRule, retention_days: u64) -> Result<(), String> {
+    let mut roots = backup_sides(rule)
+        .into_iter()
+        .filter_map(|side| backup_root_for_side(rule, side).ok())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+
+    for root in roots {
+        purge_expired_backups(&root, retention_days)?;
+    }
+
+    Ok(())
+}
+
+fn purge_expired_backups(backup_root: &Path, retention_days: u64) -> Result<(), String> {
     if retention_days == 0 {
         return Ok(());
     }
 
     let cutoff = Utc::now() - Duration::days(retention_days as i64);
-    let backup_root = backup_root(rule)?;
     if !backup_root.exists() {
         return Ok(());
     }
@@ -461,7 +769,17 @@ fn copy_file_atomic(source: &Path, target: &Path) -> Result<(), String> {
         }
     }
 
+    preserve_modified_time(source, target)?;
     Ok(())
+}
+
+fn preserve_modified_time(source: &Path, target: &Path) -> Result<(), String> {
+    let modified = fs::metadata(source)
+        .map_err(|error| format_io_error("读取源文件时间失败", source, error))?
+        .modified()
+        .map_err(|error| format_io_error("读取源文件时间失败", source, error))?;
+    set_file_mtime(target, FileTime::from_system_time(modified))
+        .map_err(|error| format_io_error("写入目标文件时间失败", target, error))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
@@ -471,16 +789,13 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|error| format_io_error("创建目标目录失败", parent, error))
 }
 
-fn normalize_path(input: &str) -> Result<String, String> {
+fn normalize_source_path(input: &str) -> Result<String, String> {
     let trimmed = input.trim().trim_matches('"');
     if trimmed.is_empty() {
         return Err("路径不能为空。".to_string());
     }
 
     let path = PathBuf::from(trimmed);
-    if !path.exists() {
-        return Err("源路径不存在。".to_string());
-    }
     if !path.is_absolute() {
         return Err("请使用绝对路径。".to_string());
     }
@@ -500,30 +815,24 @@ fn normalize_target_path(input: &str) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-fn validate_rule_paths(kind: &RuleKind, source: &str, target: &str) -> Result<(), String> {
+fn validate_rule_paths(
+    kind: &RuleKind,
+    source: &str,
+    target: &str,
+    bidirectional: bool,
+) -> Result<(), String> {
     let source_path = PathBuf::from(source);
     let target_path = PathBuf::from(target);
 
-    match kind {
-        RuleKind::File if !source_path.is_file() => {
-            return Err("文件规则要求源路径必须是文件。".to_string())
-        }
-        RuleKind::Folder if !source_path.is_dir() => {
-            return Err("文件夹规则要求源路径必须是文件夹。".to_string())
-        }
-        _ => {}
-    }
+    validate_existing_side(kind, &source_path, "源路径", true)?;
+    validate_existing_side(kind, &target_path, "目标路径", false)?;
 
-    if target_path.exists() {
-        match kind {
-            RuleKind::File if target_path.is_dir() => {
-                return Err("文件规则的目标路径不能是文件夹，请选择最终文件路径。".to_string())
-            }
-            RuleKind::Folder if target_path.is_file() => {
-                return Err("文件夹规则的目标路径不能是文件，请选择目标目录路径。".to_string())
-            }
-            _ => {}
+    if bidirectional {
+        if !source_path.exists() && !target_path.exists() {
+            return Err("双向同步要求源路径和目标路径至少有一侧已存在。".to_string());
         }
+    } else if !source_path.exists() {
+        return Err("源路径不存在。".to_string());
     }
 
     if source_path == target_path {
@@ -535,6 +844,82 @@ fn validate_rule_paths(kind: &RuleKind, source: &str, target: &str) -> Result<()
     }
 
     Ok(())
+}
+
+fn validate_existing_side(
+    kind: &RuleKind,
+    path: &Path,
+    label: &str,
+    is_source: bool,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    match kind {
+        RuleKind::File if path.is_dir() => {
+            if is_source {
+                Err("文件规则要求源路径必须是文件。".to_string())
+            } else {
+                Err("文件规则的目标路径不能是文件夹，请选择最终文件路径。".to_string())
+            }
+        }
+        RuleKind::Folder if path.is_file() => {
+            if is_source {
+                Err("文件夹规则要求源路径必须是文件夹。".to_string())
+            } else {
+                Err("文件夹规则的目标路径不能是文件，请选择目标目录路径。".to_string())
+            }
+        }
+        _ => {
+            let _ = label;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn default_delete_policy(kind: RuleKind, bidirectional: bool) -> DeletePolicy {
+    let _ = bidirectional;
+    if matches!(kind, RuleKind::Folder) {
+        DeletePolicy::MoveToBackup
+    } else {
+        DeletePolicy::NoDelete
+    }
+}
+
+pub(crate) fn capture_rule_sync_state(rule: &SyncRule) -> Result<RuleSyncState, String> {
+    if !rule.bidirectional {
+        return Ok(RuleSyncState::default());
+    }
+
+    match rule.kind {
+        RuleKind::File => {
+            let source = PathBuf::from(&rule.source_path);
+            let target = PathBuf::from(&rule.target_path);
+            if source.exists() && target.exists() && source.is_file() && target.is_file() && files_match(&source, &target)? {
+                Ok(RuleSyncState {
+                    mirrored_entries: vec![FILE_SYNC_ENTRY.to_string()],
+                })
+            } else {
+                Ok(RuleSyncState::default())
+            }
+        }
+        RuleKind::Folder => {
+            let matcher = build_matcher(rule)?;
+            let source_files = collect_folder_files(Path::new(&rule.source_path), &matcher)?;
+            let target_files = collect_folder_files(Path::new(&rule.target_path), &matcher)?;
+            let mirrored_entries = source_files
+                .keys()
+                .filter(|relative| target_files.contains_key(*relative))
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(RuleSyncState { mirrored_entries })
+        }
+    }
+}
+
+fn synced_entry_set(sync_state: &RuleSyncState) -> BTreeSet<String> {
+    sync_state.mirrored_entries.iter().cloned().collect()
 }
 
 fn paths_overlap(source: &Path, target: &Path) -> bool {
@@ -597,8 +982,13 @@ fn timestamped_path(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+#[cfg(test)]
 fn backup_root(rule: &SyncRule) -> Result<PathBuf, String> {
-    let target = PathBuf::from(&rule.target_path);
+    backup_root_for_side(rule, RuleSide::Target)
+}
+
+fn backup_root_for_side(rule: &SyncRule, side: RuleSide) -> Result<PathBuf, String> {
+    let target = path_for_side(rule, side);
     let parent = target
         .parent()
         .ok_or_else(|| "目标路径缺少父目录，无法生成备份目录。".to_string())?;
@@ -606,20 +996,42 @@ fn backup_root(rule: &SyncRule) -> Result<PathBuf, String> {
     Ok(parent.join(".back"))
 }
 
-fn backup_cleanup_candidates(rule: &SyncRule) -> Result<Vec<CleanupCandidate>, String> {
-    match rule.kind {
-        RuleKind::File => backup_candidates_for_file_rule(rule),
-        RuleKind::Folder => backup_candidates_for_folder_rule(rule),
+fn path_for_side(rule: &SyncRule, side: RuleSide) -> PathBuf {
+    match side {
+        RuleSide::Source => PathBuf::from(&rule.source_path),
+        RuleSide::Target => PathBuf::from(&rule.target_path),
     }
 }
 
-fn backup_candidates_for_file_rule(rule: &SyncRule) -> Result<Vec<CleanupCandidate>, String> {
-    let root = backup_root(rule)?;
+fn backup_sides(rule: &SyncRule) -> Vec<RuleSide> {
+    if rule.bidirectional {
+        vec![RuleSide::Source, RuleSide::Target]
+    } else {
+        vec![RuleSide::Target]
+    }
+}
+
+fn backup_cleanup_candidates(rule: &SyncRule) -> Result<Vec<CleanupCandidate>, String> {
+    let mut candidates = Vec::new();
+    for side in backup_sides(rule) {
+        let mut side_candidates = match rule.kind {
+            RuleKind::File => backup_candidates_for_file_rule(rule, side),
+            RuleKind::Folder => backup_candidates_for_folder_rule(rule, side),
+        }?;
+        candidates.append(&mut side_candidates);
+    }
+
+    candidates.sort_by(|left, right| right.path.len().cmp(&left.path.len()));
+    Ok(candidates)
+}
+
+fn backup_candidates_for_file_rule(rule: &SyncRule, side: RuleSide) -> Result<Vec<CleanupCandidate>, String> {
+    let root = backup_root_for_side(rule, side)?;
     if !root.exists() {
         return Ok(Vec::new());
     }
 
-    let target = PathBuf::from(&rule.target_path);
+    let target = path_for_side(rule, side);
     let original_name = target
         .file_name()
         .and_then(|value| value.to_str())
@@ -628,7 +1040,10 @@ fn backup_candidates_for_file_rule(rule: &SyncRule) -> Result<Vec<CleanupCandida
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("backup");
-    let extension = target.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
 
     let mut candidates = Vec::new();
     for entry in fs::read_dir(&root).map_err(to_error)? {
@@ -638,29 +1053,33 @@ fn backup_candidates_for_file_rule(rule: &SyncRule) -> Result<Vec<CleanupCandida
             continue;
         }
 
-        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
         let is_match = if extension.is_empty() {
             file_name.starts_with(&format!("{stem}--"))
         } else {
-            file_name.starts_with(&format!("{stem}--")) && file_name.ends_with(&format!(".{extension}"))
+            file_name.starts_with(&format!("{stem}--"))
+                && file_name.ends_with(&format!(".{extension}"))
         };
 
         if is_match {
             candidates.push(CleanupCandidate {
                 path: path.to_string_lossy().to_string(),
-                relative_path: original_name.to_string(),
+                relative_path: format_candidate_relative(rule.bidirectional, side, original_name),
                 kind: CleanupCandidateKind::File,
             });
         }
     }
 
-    candidates.sort_by(|left, right| right.path.cmp(&left.path));
     Ok(candidates)
 }
 
-fn backup_candidates_for_folder_rule(rule: &SyncRule) -> Result<Vec<CleanupCandidate>, String> {
-    let scope = backup_root(rule)?.join(
-        Path::new(&rule.target_path)
+fn backup_candidates_for_folder_rule(rule: &SyncRule, side: RuleSide) -> Result<Vec<CleanupCandidate>, String> {
+    let side_root = path_for_side(rule, side);
+    let scope = backup_root_for_side(rule, side)?.join(
+        side_root
             .file_name()
             .ok_or_else(|| "目标目录无效，无法预览备份。".to_string())?,
     );
@@ -677,7 +1096,11 @@ fn backup_candidates_for_folder_rule(rule: &SyncRule) -> Result<Vec<CleanupCandi
 
         candidates.push(CleanupCandidate {
             path: path.to_string_lossy().to_string(),
-            relative_path: normalize_relative(path.strip_prefix(&scope).map_err(to_error)?),
+            relative_path: format_candidate_relative(
+                rule.bidirectional,
+                side,
+                &normalize_relative(path.strip_prefix(&scope).map_err(to_error)?),
+            ),
             kind: if entry.file_type().is_dir() {
                 CleanupCandidateKind::Folder
             } else {
@@ -686,8 +1109,22 @@ fn backup_candidates_for_folder_rule(rule: &SyncRule) -> Result<Vec<CleanupCandi
         });
     }
 
-    candidates.sort_by(|left, right| right.path.len().cmp(&left.path.len()));
     Ok(candidates)
+}
+
+fn format_candidate_relative(bidirectional: bool, side: RuleSide, relative: &str) -> String {
+    if bidirectional {
+        format!("{} / {}", side_label(side), relative)
+    } else {
+        relative.to_string()
+    }
+}
+
+fn side_label(side: RuleSide) -> &'static str {
+    match side {
+        RuleSide::Source => "源侧",
+        RuleSide::Target => "目标侧",
+    }
 }
 
 fn build_outcome(
@@ -735,21 +1172,28 @@ fn build_outcome(
     }
 }
 
-fn success_message(counts: &RunCounts) -> String {
+fn success_message(rule: &SyncRule, counts: &RunCounts) -> String {
+    let mode = if rule.bidirectional { "双向同步" } else { "同步" };
     if counts.copied_count == 0
         && counts.updated_count == 0
         && counts.skipped_count > 0
         && counts.backup_count == 0
     {
         return format!(
-            "未执行覆盖：目标文件已存在且内容一致（未变更 {}）。",
+            "{}完成：两侧内容已是最新状态（未变更 {}）。",
+            mode,
             counts.skipped_count
         );
     }
 
     format!(
-        "同步完成：新增 {}，更新 {}，未变更 {}，备份 {}。",
-        counts.copied_count, counts.updated_count, counts.skipped_count, counts.backup_count
+        "{}完成：新增 {}，更新 {}，删除 {}，未变更 {}，备份 {}。",
+        mode,
+        counts.copied_count,
+        counts.updated_count,
+        counts.deleted_count,
+        counts.skipped_count,
+        counts.backup_count
     )
 }
 
@@ -805,6 +1249,7 @@ fn format_copy_fallback_error(
 mod tests {
     use super::*;
     use crate::models::{AppSettings, RuleDraft, RuleKind};
+    use filetime::{set_file_mtime, FileTime};
     use std::fs;
     use tempfile::tempdir;
 
@@ -822,6 +1267,7 @@ mod tests {
             kind: RuleKind::File,
             source_path: source.to_string_lossy().to_string(),
             target_path: target.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -848,6 +1294,7 @@ mod tests {
             kind: RuleKind::File,
             source_path: source.to_string_lossy().to_string(),
             target_path: target.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -879,6 +1326,7 @@ mod tests {
             kind: RuleKind::File,
             source_path: source.to_string_lossy().to_string(),
             target_path: target.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -910,6 +1358,7 @@ mod tests {
             kind: RuleKind::File,
             source_path: source.to_string_lossy().to_string(),
             target_path: target.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -949,6 +1398,7 @@ mod tests {
             kind: RuleKind::Folder,
             source_path: source_root.to_string_lossy().to_string(),
             target_path: target_root.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -962,6 +1412,47 @@ mod tests {
         assert_eq!(outcome.last_result.backup_count, 0);
         assert_eq!(outcome.last_result.skipped_count, 1);
         assert!(!backup_root(&rule).unwrap().exists());
+    }
+
+    #[test]
+    fn single_direction_folder_moves_extra_target_files_to_backup() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("notes");
+        let target_root = temp.path().join("docs");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(target_root.join("nested")).unwrap();
+        fs::write(source_root.join("guide.md"), "source-guide").unwrap();
+        fs::write(target_root.join("guide.md"), "source-guide").unwrap();
+        fs::write(target_root.join("nested").join("old.md"), "legacy").unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "docs".into(),
+            enabled: true,
+            kind: RuleKind::Folder,
+            source_path: source_root.to_string_lossy().to_string(),
+            target_path: target_root.to_string_lossy().to_string(),
+            bidirectional: false,
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+        let rule = build_rule(None, draft, &settings).unwrap();
+
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        let backup_files = WalkDir::new(backup_root(&rule).unwrap())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+
+        assert!(!target_root.join("nested").join("old.md").exists());
+        assert_eq!(outcome.last_result.deleted_count, 1);
+        assert_eq!(outcome.last_result.backup_count, 1);
+        assert_eq!(backup_files, 1);
     }
 
     #[test]
@@ -979,6 +1470,7 @@ mod tests {
             kind: RuleKind::File,
             source_path: source.to_string_lossy().to_string(),
             target_path: target.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -1006,6 +1498,7 @@ mod tests {
             kind: RuleKind::Folder,
             source_path: source.to_string_lossy().to_string(),
             target_path: target.to_string_lossy().to_string(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -1016,5 +1509,182 @@ mod tests {
 
         let error = build_rule(None, draft, &settings).unwrap_err();
         assert!(error.contains("目标路径不能是文件"));
+    }
+
+    #[test]
+    fn bidirectional_file_prefers_newer_timestamp() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("left.md");
+        let target = temp.path().join("right.md");
+        fs::write(&source, "old-source").unwrap();
+        fs::write(&target, "new-target").unwrap();
+
+        set_file_mtime(&source, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+        set_file_mtime(&target, FileTime::from_unix_time(1_700_000_100, 0)).unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "双向文件".into(),
+            enabled: true,
+            kind: RuleKind::File,
+            source_path: source.to_string_lossy().to_string(),
+            target_path: target.to_string_lossy().to_string(),
+            bidirectional: true,
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+
+        let rule = build_rule(None, draft, &settings).unwrap();
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "new-target");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new-target");
+        assert_eq!(outcome.last_result.updated_count, 1);
+        assert_eq!(outcome.last_result.backup_count, 1);
+    }
+
+    #[test]
+    fn bidirectional_folder_syncs_missing_and_newer_files() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("notes");
+        let target_root = temp.path().join("docs");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&target_root).unwrap();
+
+        let source_only = source_root.join("source-only.md");
+        let shared_source = source_root.join("shared.md");
+        let target_only = target_root.join("target-only.md");
+        let shared_target = target_root.join("shared.md");
+
+        fs::write(&source_only, "from-source").unwrap();
+        fs::write(&shared_source, "older-source").unwrap();
+        fs::write(&target_only, "from-target").unwrap();
+        fs::write(&shared_target, "newer-target").unwrap();
+
+        set_file_mtime(&shared_source, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+        set_file_mtime(&shared_target, FileTime::from_unix_time(1_700_000_100, 0)).unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "双向目录".into(),
+            enabled: true,
+            kind: RuleKind::Folder,
+            source_path: source_root.to_string_lossy().to_string(),
+            target_path: target_root.to_string_lossy().to_string(),
+            bidirectional: true,
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+
+        let rule = build_rule(None, draft, &settings).unwrap();
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+
+        assert_eq!(fs::read_to_string(source_root.join("target-only.md")).unwrap(), "from-target");
+        assert_eq!(fs::read_to_string(target_root.join("source-only.md")).unwrap(), "from-source");
+        assert_eq!(fs::read_to_string(source_root.join("shared.md")).unwrap(), "newer-target");
+        assert_eq!(fs::read_to_string(target_root.join("shared.md")).unwrap(), "newer-target");
+        assert_eq!(outcome.last_result.copied_count, 2);
+        assert_eq!(outcome.last_result.updated_count, 1);
+        assert_eq!(outcome.last_result.backup_count, 1);
+    }
+
+    #[test]
+    fn bidirectional_file_propagates_deletion_after_baseline_sync() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("left.md");
+        let target = temp.path().join("right.md");
+        fs::write(&source, "shared-content").unwrap();
+        fs::write(&target, "shared-content").unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "双向文件删除".into(),
+            enabled: true,
+            kind: RuleKind::File,
+            source_path: source.to_string_lossy().to_string(),
+            target_path: target.to_string_lossy().to_string(),
+            bidirectional: true,
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+
+        let mut rule = build_rule(None, draft, &settings).unwrap();
+        let first = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        assert_eq!(first.last_result.skipped_count, 1);
+
+        rule.sync_state = capture_rule_sync_state(&rule).unwrap();
+        fs::remove_file(&source).unwrap();
+
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        let backup_files = WalkDir::new(backup_root_for_side(&rule, RuleSide::Target).unwrap())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+
+        assert!(!source.exists());
+        assert!(!target.exists());
+        assert_eq!(outcome.last_result.deleted_count, 1);
+        assert_eq!(outcome.last_result.backup_count, 1);
+        assert_eq!(backup_files, 1);
+    }
+
+    #[test]
+    fn bidirectional_folder_propagates_deletion_after_baseline_sync() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("notes");
+        let target_root = temp.path().join("docs");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&target_root).unwrap();
+        fs::write(source_root.join("shared.md"), "shared-content").unwrap();
+        fs::write(target_root.join("shared.md"), "shared-content").unwrap();
+
+        let settings = AppSettings::default();
+        let draft = RuleDraft {
+            name: "双向目录删除".into(),
+            enabled: true,
+            kind: RuleKind::Folder,
+            source_path: source_root.to_string_lossy().to_string(),
+            target_path: target_root.to_string_lossy().to_string(),
+            bidirectional: true,
+            auto_sync: true,
+            watch_enabled: true,
+            poll_fallback_enabled: true,
+            poll_interval_sec: 300,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+        };
+
+        let mut rule = build_rule(None, draft, &settings).unwrap();
+        let first = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        assert_eq!(first.last_result.skipped_count, 1);
+
+        rule.sync_state = capture_rule_sync_state(&rule).unwrap();
+        fs::remove_file(source_root.join("shared.md")).unwrap();
+
+        let outcome = run_rule_sync(&rule, &settings, SyncTrigger::Manual);
+        let backup_files = WalkDir::new(backup_root_for_side(&rule, RuleSide::Target).unwrap())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+
+        assert!(!source_root.join("shared.md").exists());
+        assert!(!target_root.join("shared.md").exists());
+        assert_eq!(outcome.last_result.deleted_count, 1);
+        assert_eq!(outcome.last_result.backup_count, 1);
+        assert_eq!(backup_files, 1);
     }
 }

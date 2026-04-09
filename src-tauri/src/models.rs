@@ -17,6 +17,7 @@ pub enum ConflictPolicy {
 #[serde(rename_all = "camelCase")]
 pub enum DeletePolicy {
     NoDelete,
+    MoveToBackup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,10 +34,12 @@ pub enum SyncTrigger {
 #[serde(rename_all = "camelCase")]
 pub enum RuleHealth {
     Healthy,
+    InvalidConfiguration,
     MissingSource,
     InvalidSourceType,
     InvalidTargetPath,
     OverlappingDirectories,
+    WatchUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,6 +58,13 @@ pub struct RuleLastResult {
     pub error_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleSyncState {
+    #[serde(default)]
+    pub mirrored_entries: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncRule {
@@ -64,6 +74,8 @@ pub struct SyncRule {
     pub kind: RuleKind,
     pub source_path: String,
     pub target_path: String,
+    #[serde(default)]
+    pub bidirectional: bool,
     pub auto_sync: bool,
     pub watch_enabled: bool,
     pub poll_fallback_enabled: bool,
@@ -72,11 +84,15 @@ pub struct SyncRule {
     pub delete_policy: DeletePolicy,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
+    #[serde(default)]
+    pub sync_state: RuleSyncState,
     pub last_sync_at: Option<String>,
     #[serde(default)]
     pub last_result: RuleLastResult,
     #[serde(default = "default_health")]
     pub health: RuleHealth,
+    #[serde(default)]
+    pub config_error: Option<String>,
 }
 
 fn default_health() -> RuleHealth {
@@ -91,6 +107,8 @@ pub struct RuleDraft {
     pub kind: RuleKind,
     pub source_path: String,
     pub target_path: String,
+    #[serde(default)]
+    pub bidirectional: bool,
     pub auto_sync: bool,
     pub watch_enabled: bool,
     pub poll_fallback_enabled: bool,
@@ -213,6 +231,7 @@ impl Default for SyncRule {
             kind: RuleKind::File,
             source_path: String::new(),
             target_path: String::new(),
+            bidirectional: false,
             auto_sync: true,
             watch_enabled: true,
             poll_fallback_enabled: true,
@@ -221,9 +240,11 @@ impl Default for SyncRule {
             delete_policy: DeletePolicy::NoDelete,
             include_globs: Vec::new(),
             exclude_globs: Vec::new(),
+            sync_state: RuleSyncState::default(),
             last_sync_at: None,
             last_result: RuleLastResult::default(),
             health: RuleHealth::Healthy,
+            config_error: None,
         }
     }
 }

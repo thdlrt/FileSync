@@ -1,10 +1,12 @@
 export type RuleKind = "file" | "folder";
 export type RuleHealth =
   | "healthy"
+  | "invalidConfiguration"
   | "missingSource"
   | "invalidSourceType"
   | "invalidTargetPath"
-  | "overlappingDirectories";
+  | "overlappingDirectories"
+  | "watchUnavailable";
 export type SyncTrigger = "manual" | "watch" | "poll" | "startup" | "cleanup";
 export type CleanupCandidateKind = "file" | "folder";
 
@@ -29,6 +31,7 @@ export interface SyncRule {
   kind: RuleKind;
   sourcePath: string;
   targetPath: string;
+  bidirectional: boolean;
   autoSync: boolean;
   watchEnabled: boolean;
   pollFallbackEnabled: boolean;
@@ -38,6 +41,7 @@ export interface SyncRule {
   lastSyncAt: string | null;
   lastResult: RuleLastResult;
   health: RuleHealth;
+  configError: string | null;
 }
 
 export interface RuleDraft {
@@ -46,6 +50,7 @@ export interface RuleDraft {
   kind: RuleKind;
   sourcePath: string;
   targetPath: string;
+  bidirectional: boolean;
   autoSync: boolean;
   watchEnabled: boolean;
   pollFallbackEnabled: boolean;

@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
+    "tauri:build:portable:debug": "tauri build --debug --no-bundle",
+    "tauri:build:portable:release": "tauri build --no-bundle",
     "tauri:build:debug": "tauri build --debug",
     "tauri:build:release": "tauri build"
   },

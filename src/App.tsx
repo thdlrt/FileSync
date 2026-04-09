@@ -38,6 +38,7 @@ const createEmptyDraft = (settings: AppSettings): RuleDraft => ({
   kind: "file",
   sourcePath: "",
   targetPath: "",
+  bidirectional: false,
   autoSync: true,
   watchEnabled: true,
   pollFallbackEnabled: true,
@@ -47,6 +48,7 @@ const createEmptyDraft = (settings: AppSettings): RuleDraft => ({
 });
 
 function App() {
+  const isDevelopmentRuntime = import.meta.env.DEV;
   const [page, setPage] = useState<Page>("dashboard");
   const [snapshot, setSnapshot] = useState<AppStateSnapshot | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(emptySettings);
@@ -89,6 +91,7 @@ function App() {
     ruleDraft.kind === "file" &&
     fileTargetDirectory.trim().length > 0 &&
     fileTargetFileName.trim().length === 0;
+  const autostartEnableBlocked = isDevelopmentRuntime && !settingsDraft.launchOnStartup;
 
   const sortedRules = useMemo(
     () =>
@@ -230,6 +233,7 @@ function App() {
       kind: rule.kind,
       sourcePath: rule.sourcePath,
       targetPath: rule.targetPath,
+      bidirectional: rule.bidirectional,
       autoSync: rule.autoSync,
       watchEnabled: rule.watchEnabled,
       pollFallbackEnabled: rule.pollFallbackEnabled,
@@ -453,14 +457,19 @@ function App() {
       let autostartError: string | null = null;
       const beforeAutostart = await safeGetAutostartEnabled();
       if (settingsDraft.launchOnStartup !== beforeAutostart) {
-        try {
-          if (settingsDraft.launchOnStartup) {
-            await enable();
-          } else {
-            await disable();
+        if (isDevelopmentRuntime && settingsDraft.launchOnStartup) {
+          autostartError =
+            "当前是 tauri dev 开发模式，无法可靠注册开机自启。请先构建便携版或安装版，再在构建产物中开启。";
+        } else {
+          try {
+            if (settingsDraft.launchOnStartup) {
+              await enable();
+            } else {
+              await disable();
+            }
+          } catch (error) {
+            autostartError = formatError(error);
           }
-        } catch (error) {
-          autostartError = formatError(error);
         }
       }
 
@@ -481,7 +490,9 @@ function App() {
       flashStatus(
         autostartError
           ? `设置已保存，但开机自启未生效：${autostartError}`
-          : "设置已保存。",
+          : actualAutostart
+            ? "设置已保存。下次登录 Windows 时会以托盘后台模式自动启动。"
+            : "设置已保存。",
         autostartError ? "error" : "success"
       );
     } catch (error) {
@@ -811,6 +822,7 @@ function App() {
                             {healthLabel(rule.health)}
                           </span>
                           <span className="badge kind">{rule.kind === "file" ? "文件规则" : "文件夹规则"}</span>
+                          <span className="badge kind">{syncModeLabel(rule.bidirectional)}</span>
                         </div>
                         <p className="path-row">
                           <span>源：</span>
@@ -844,7 +856,12 @@ function App() {
                           <button className="secondary-button" onClick={() => handleToggleRule(rule)}>
                             {rule.enabled ? "停用" : "启用"}
                           </button>
-                          <button className="secondary-button" onClick={() => handleRunRule(rule)}>
+                          <button
+                            className="secondary-button"
+                            onClick={() => handleRunRule(rule)}
+                            disabled={!canRunRuleManually(rule)}
+                            title={rule.configError ?? undefined}
+                          >
                             {busyAction === `run-${rule.id}` ? "同步中..." : "立即同步"}
                           </button>
                           <button className="secondary-button" onClick={() => openEditRuleModal(rule)}>
@@ -870,6 +887,10 @@ function App() {
 
                     <div className="rule-meta-grid">
                       <div>
+                        <span>同步方向</span>
+                        <strong>{syncModeLabel(rule.bidirectional)}</strong>
+                      </div>
+                      <div>
                         <span>自动同步</span>
                         <strong>{rule.autoSync ? "开启" : "关闭"}</strong>
                       </div>
@@ -891,11 +912,12 @@ function App() {
 
                     <div className="result-strip">
                       <strong>{rule.lastResult.message || "等待第一次同步"}</strong>
+                      {rule.configError ? <small>异常说明：{rule.configError}</small> : null}
                       <small>
                         新增 {rule.lastResult.copiedCount} / 更新 {rule.lastResult.updatedCount} / 未变更{" "}
-                        {rule.lastResult.skippedCount} / 备份 {rule.lastResult.backupCount}
+                        {rule.lastResult.skippedCount} / 删除 {rule.lastResult.deletedCount} / 备份 {rule.lastResult.backupCount}
                       </small>
-                      <small>未变更表示目标内容已经是最新状态，这次无需覆盖。</small>
+                      <small>删除表示目标侧多余文件已移入 .back，未变更表示当前同步范围内无需覆盖。</small>
                     </div>
                   </article>
                 ))
@@ -939,11 +961,16 @@ function App() {
                 <label className="toggle-row">
                   <div className="toggle-copy">
                     <strong>开机自启</strong>
-                    <p>登录 Windows 后自动启动 FileSync Notes。</p>
+                    <p>
+                      {isDevelopmentRuntime
+                        ? "当前是 tauri dev 模式，只允许关闭已注册的开机自启。要测试开启效果，请先构建便携版或安装版。"
+                        : "登录 Windows 后自动启动 FileSync Notes，并默认以托盘后台模式启动。"}
+                    </p>
                   </div>
                   <input
                     type="checkbox"
                     checked={settingsDraft.launchOnStartup}
+                    disabled={autostartEnableBlocked}
                     onChange={(event) => updateSettings("launchOnStartup", event.currentTarget.checked)}
                   />
                 </label>
@@ -1236,6 +1263,20 @@ function App() {
 
               <div className="inline-grid">
                 <label className="toggle-card">
+                  <span>双向同步</span>
+                  <input
+                    type="checkbox"
+                    checked={ruleDraft.bidirectional}
+                    onChange={(event) => {
+                      const checked = event.currentTarget.checked;
+                      setRuleDraft((current) => ({
+                        ...current,
+                        bidirectional: checked,
+                      }));
+                    }}
+                  />
+                </label>
+                <label className="toggle-card">
                   <span>启用规则</span>
                   <input
                     type="checkbox"
@@ -1292,6 +1333,12 @@ function App() {
                   />
                 </label>
               </div>
+
+              <small>
+                {ruleDraft.bidirectional
+                  ? "双向同步会比较两侧最后修改时间，用较新一侧覆盖较旧一侧；若时间戳相同但内容不同，默认保留源路径。"
+                  : "单向同步只会从源路径覆盖到目标路径。"}
+              </small>
 
               <label className="field-group">
                 <span>轮询间隔（秒）</span>
@@ -1531,14 +1578,18 @@ function healthLabel(health: string) {
   switch (health) {
     case "healthy":
       return "健康";
+    case "invalidConfiguration":
+      return "配置损坏";
     case "missingSource":
-      return "源不存在";
+      return "路径缺失";
     case "invalidSourceType":
       return "源类型错误";
     case "invalidTargetPath":
       return "目标路径无效";
     case "overlappingDirectories":
       return "目录互相包含";
+    case "watchUnavailable":
+      return "监听异常";
     default:
       return health;
   }
@@ -1546,6 +1597,14 @@ function healthLabel(health: string) {
 
 function healthClassName(health: string) {
   return health === "healthy" ? "success" : "error";
+}
+
+function canRunRuleManually(rule: SyncRule) {
+  return rule.health === "healthy" || rule.health === "watchUnavailable";
+}
+
+function syncModeLabel(bidirectional: boolean) {
+  return bidirectional ? "双向同步" : "单向同步";
 }
 
 function formatError(error: unknown) {

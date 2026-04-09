@@ -1,11 +1,13 @@
 use crate::models::{
     AppLogEntry, AppSettings, AppStateSnapshot, CleanupPreview, DashboardSummary, PersistedStore,
-    RuleDraft, RuleHealth, SyncRule, SyncTrigger,
+    RuleDraft, RuleHealth, RuleKind, RuleLastResult, RuleSyncState, SyncHistoryItem, SyncRule,
+    SyncTrigger,
 };
 use crate::sync_engine;
 use chrono::Utc;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use serde_json::{Map, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, Wry};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct SharedState {
@@ -24,6 +27,7 @@ struct InnerState {
     app: AppHandle<Wry>,
     store: Mutex<PersistedStore>,
     watchers: Mutex<HashMap<String, RuleWatcher>>,
+    watcher_failures: Mutex<HashMap<String, String>>,
     runtime: Mutex<HashMap<String, RuleRuntime>>,
     automatic_sync_paused: AtomicBool,
 }
@@ -41,6 +45,12 @@ struct RuleRuntime {
     last_poll_at: Option<Instant>,
 }
 
+struct StoreLoadOutcome {
+    store: PersistedStore,
+    repaired: bool,
+    warnings: Vec<String>,
+}
+
 impl SharedState {
     pub fn new(app: AppHandle<Wry>) -> Result<Self, String> {
         let store = load_store(&app)?;
@@ -49,6 +59,7 @@ impl SharedState {
                 app,
                 store: Mutex::new(store),
                 watchers: Mutex::new(HashMap::new()),
+                watcher_failures: Mutex::new(HashMap::new()),
                 runtime: Mutex::new(HashMap::new()),
                 automatic_sync_paused: AtomicBool::new(false),
             }),
@@ -66,11 +77,15 @@ impl SharedState {
     pub async fn snapshot(&self) -> Result<AppStateSnapshot, String> {
         self.recompute_health_and_save().await?;
         let store = self.inner.store.lock().await;
-        let rules = store.rules.clone();
+        let mut rules = store.rules.clone();
         let history = store.history.clone();
         let settings = store.settings.clone();
-        let automatic_sync_paused = self.inner.automatic_sync_paused.load(Ordering::Relaxed);
         drop(store);
+
+        let watcher_failures = self.inner.watcher_failures.lock().await.clone();
+        apply_watcher_failures_to_rules(&mut rules, &watcher_failures);
+
+        let automatic_sync_paused = self.inner.automatic_sync_paused.load(Ordering::Relaxed);
 
         let summary = DashboardSummary {
             total_rules: rules.len(),
@@ -128,7 +143,9 @@ impl SharedState {
     }
 
     pub fn get_log_path(&self) -> Result<String, String> {
-        Ok(log_file_path(&self.inner.app)?.to_string_lossy().to_string())
+        Ok(log_file_path(&self.inner.app)?
+            .to_string_lossy()
+            .to_string())
     }
 
     pub async fn create_rule(&self, draft: RuleDraft) -> Result<AppStateSnapshot, String> {
@@ -431,18 +448,27 @@ impl SharedState {
         if let Some(rule) = store.rules.iter_mut().find(|rule| rule.id == rule_id) {
             rule.last_sync_at = outcome.last_result.finished_at.clone();
             rule.last_result = outcome.last_result;
+            if rule.last_result.success {
+                if let Ok(sync_state) = sync_engine::capture_rule_sync_state(rule) {
+                    rule.sync_state = sync_state;
+                }
+            }
             rule.health = sync_engine::evaluate_rule_health(rule);
         }
 
         let log_message = if outcome.history_item.success {
             format!(
                 "规则“{}”执行成功，触发方式：{:?}，消息：{}",
-                outcome.history_item.rule_name, outcome.history_item.trigger, outcome.history_item.message
+                outcome.history_item.rule_name,
+                outcome.history_item.trigger,
+                outcome.history_item.message
             )
         } else {
             format!(
                 "规则“{}”执行失败，触发方式：{:?}，消息：{}",
-                outcome.history_item.rule_name, outcome.history_item.trigger, outcome.history_item.message
+                outcome.history_item.rule_name,
+                outcome.history_item.trigger,
+                outcome.history_item.message
             )
         };
 
@@ -451,7 +477,11 @@ impl SharedState {
         save_store(&self.inner.app, &store)?;
         drop(store);
         self.write_log(
-            if log_message.contains("失败") { "error" } else { "info" },
+            if log_message.contains("失败") {
+                "error"
+            } else {
+                "info"
+            },
             log_message,
         );
         Ok(())
@@ -477,10 +507,11 @@ impl SharedState {
 
     async fn refresh_watchers(&self) -> Result<(), String> {
         let rules = { self.inner.store.lock().await.rules.clone() };
-        let mut watchers = self.inner.watchers.lock().await;
-        watchers.clear();
+        let mut next_watchers = HashMap::new();
+        let mut next_failures = HashMap::new();
+        let mut warnings = Vec::new();
 
-        for rule in rules {
+        'rules: for rule in rules {
             if !rule.enabled
                 || !rule.auto_sync
                 || !rule.watch_enabled
@@ -489,24 +520,36 @@ impl SharedState {
                 continue;
             }
 
-            let watch_path = match rule.kind {
-                crate::models::RuleKind::File => PathBuf::from(&rule.source_path)
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| "源文件缺少父目录，无法监听。".to_string())?,
-                crate::models::RuleKind::Folder => PathBuf::from(&rule.source_path),
+            let watch_targets = match collect_watch_targets(&rule) {
+                Ok(targets) => targets,
+                Err(error) => {
+                    let message = format!("监听不可用：{error}");
+                    next_failures.insert(rule.id.clone(), message.clone());
+                    warnings.push(format!(
+                        "规则“{}”的自动监听已降级，不会阻止应用启动。{}",
+                        rule.name, message
+                    ));
+                    continue;
+                }
             };
             let source_path = PathBuf::from(&rule.source_path);
+            let target_path = PathBuf::from(&rule.target_path);
             let state = self.clone();
             let rule_id = rule.id.clone();
             let rule_kind = rule.kind.clone();
+            let bidirectional = rule.bidirectional;
 
-            let mut watcher = RecommendedWatcher::new(
+            let mut watcher = match RecommendedWatcher::new(
                 move |event: Result<Event, notify::Error>| {
                     if let Ok(event) = event {
                         let relevant = event.paths.iter().any(|path| match rule_kind {
-                            crate::models::RuleKind::File => path == &source_path,
-                            crate::models::RuleKind::Folder => path.starts_with(&source_path),
+                            crate::models::RuleKind::File => {
+                                path == &source_path || (bidirectional && path == &target_path)
+                            }
+                            crate::models::RuleKind::Folder => {
+                                path.starts_with(&source_path)
+                                    || (bidirectional && path.starts_with(&target_path))
+                            }
                         });
 
                         if relevant {
@@ -515,21 +558,46 @@ impl SharedState {
                     }
                 },
                 Config::default(),
-            )
-            .map_err(|error| error.to_string())?;
+            ) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    let message = format!("监听器创建失败：{error}");
+                    next_failures.insert(rule.id.clone(), message.clone());
+                    warnings.push(format!(
+                        "规则“{}”的自动监听已降级，不会阻止应用启动。{}",
+                        rule.name, message
+                    ));
+                    continue;
+                }
+            };
 
-            watcher
-                .watch(
-                    &watch_path,
-                    if matches!(rule.kind, crate::models::RuleKind::Folder) {
-                        RecursiveMode::Recursive
-                    } else {
-                        RecursiveMode::NonRecursive
-                    },
-                )
-                .map_err(|error| error.to_string())?;
+            for (watch_path, recursive_mode) in watch_targets {
+                if let Err(error) = watcher.watch(&watch_path, recursive_mode) {
+                    let message = format!("无法监听路径 {}：{}", watch_path.display(), error);
+                    next_failures.insert(rule.id.clone(), message.clone());
+                    warnings.push(format!(
+                        "规则“{}”的自动监听已降级，不会阻止应用启动。{}",
+                        rule.name, message
+                    ));
+                    continue 'rules;
+                }
+            }
 
-            watchers.insert(rule.id.clone(), RuleWatcher { _watcher: watcher });
+            next_watchers.insert(rule.id.clone(), RuleWatcher { _watcher: watcher });
+        }
+
+        {
+            let mut watchers = self.inner.watchers.lock().await;
+            *watchers = next_watchers;
+        }
+
+        {
+            let mut watcher_failures = self.inner.watcher_failures.lock().await;
+            *watcher_failures = next_failures;
+        }
+
+        for warning in warnings {
+            self.write_log("warn", warning);
         }
 
         Ok(())
@@ -591,6 +659,51 @@ impl SharedState {
     }
 }
 
+fn collect_watch_targets(rule: &SyncRule) -> Result<Vec<(PathBuf, RecursiveMode)>, String> {
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    append_watch_target(&mut targets, &mut seen, Path::new(&rule.source_path), &rule.kind)?;
+    if rule.bidirectional {
+        append_watch_target(&mut targets, &mut seen, Path::new(&rule.target_path), &rule.kind)?;
+    }
+
+    if targets.is_empty() {
+        return Err("当前没有可监听的已存在路径，请先创建任一侧目录或开启轮询兜底。".to_string());
+    }
+
+    Ok(targets)
+}
+
+fn append_watch_target(
+    targets: &mut Vec<(PathBuf, RecursiveMode)>,
+    seen: &mut BTreeSet<String>,
+    path: &Path,
+    kind: &RuleKind,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let (watch_path, recursive_mode) = match kind {
+        RuleKind::File => (
+            path.parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| "文件路径缺少父目录，无法监听。".to_string())?,
+            RecursiveMode::NonRecursive,
+        ),
+        RuleKind::Folder => (path.to_path_buf(), RecursiveMode::Recursive),
+    };
+
+    let recursive = matches!(recursive_mode, RecursiveMode::Recursive);
+    let key = format!("{}::{recursive}", watch_path.display());
+    if seen.insert(key) {
+        targets.push((watch_path, recursive_mode));
+    }
+
+    Ok(())
+}
+
 fn store_file_path(app: &AppHandle<Wry>) -> Result<PathBuf, String> {
     let app_dir = app
         .path()
@@ -598,6 +711,23 @@ fn store_file_path(app: &AppHandle<Wry>) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?;
     fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
     Ok(app_dir.join("store.json"))
+}
+
+fn apply_watcher_failures_to_rules(
+    rules: &mut [SyncRule],
+    watcher_failures: &HashMap<String, String>,
+) {
+    for rule in rules {
+        if let Some(message) = watcher_failures.get(&rule.id) {
+            if rule.health == RuleHealth::Healthy {
+                rule.health = RuleHealth::WatchUnavailable;
+            }
+
+            if rule.config_error.is_none() {
+                rule.config_error = Some(message.clone());
+            }
+        }
+    }
 }
 
 fn load_store(app: &AppHandle<Wry>) -> Result<PersistedStore, String> {
@@ -608,8 +738,508 @@ fn load_store(app: &AppHandle<Wry>) -> Result<PersistedStore, String> {
         return Ok(store);
     }
 
-    let content = fs::read_to_string(store_path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content).map_err(|error| error.to_string())
+    let content = fs::read_to_string(&store_path).map_err(|error| error.to_string())?;
+    let outcome = deserialize_store_lossy(&content);
+
+    if outcome.repaired {
+        let backup_note = match backup_store_file(&store_path) {
+            Ok(path) => format!("原配置已备份到 {}", path.display()),
+            Err(error) => format!("原配置备份失败：{error}"),
+        };
+
+        for warning in &outcome.warnings {
+            let _ = append_log(
+                app,
+                "warn",
+                &format!("检测到配置异常，已自动修复。{backup_note}。{warning}"),
+            );
+        }
+
+        save_store(app, &outcome.store)?;
+    }
+
+    Ok(outcome.store)
+}
+
+fn deserialize_store_lossy(content: &str) -> StoreLoadOutcome {
+    let parsed = match serde_json::from_str::<Value>(content) {
+        Ok(value) => value,
+        Err(error) => {
+            let settings = AppSettings::default();
+            let message = format!("配置文件无法解析：{error}");
+            return StoreLoadOutcome {
+                store: PersistedStore {
+                    rules: vec![build_invalid_rule(
+                        None,
+                        None,
+                        RuleKind::File,
+                        None,
+                        None,
+                        true,
+                        false,
+                        false,
+                        false,
+                        settings.default_poll_interval_sec,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        RuleLastResult::default(),
+                        vec![message.clone()],
+                    )],
+                    settings,
+                    history: Vec::new(),
+                },
+                repaired: true,
+                warnings: vec![message],
+            };
+        }
+    };
+
+    let object = match parsed.as_object() {
+        Some(object) => object,
+        None => {
+            let settings = AppSettings::default();
+            let message = "配置文件根节点不是对象，已重建默认配置。".to_string();
+            return StoreLoadOutcome {
+                store: PersistedStore {
+                    rules: vec![build_invalid_rule(
+                        None,
+                        Some("已损坏的规则配置".to_string()),
+                        RuleKind::File,
+                        None,
+                        None,
+                        true,
+                        false,
+                        false,
+                        false,
+                        settings.default_poll_interval_sec,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        RuleLastResult::default(),
+                        vec![message.clone()],
+                    )],
+                    settings,
+                    history: Vec::new(),
+                },
+                repaired: true,
+                warnings: vec![message],
+            };
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let settings = parse_settings(object.get("settings"), &mut warnings);
+    let rules = parse_rules(object.get("rules"), &settings, &mut warnings);
+    let history = parse_history(object.get("history"), &mut warnings);
+
+    StoreLoadOutcome {
+        store: PersistedStore {
+            rules,
+            settings,
+            history,
+        },
+        repaired: !warnings.is_empty(),
+        warnings,
+    }
+}
+
+fn parse_settings(value: Option<&Value>, warnings: &mut Vec<String>) -> AppSettings {
+    match value {
+        Some(raw) => serde_json::from_value::<AppSettings>(raw.clone()).unwrap_or_else(|error| {
+            warnings.push(format!("设置项格式异常，已恢复默认值：{error}"));
+            AppSettings::default()
+        }),
+        None => AppSettings::default(),
+    }
+}
+
+fn parse_rules(
+    value: Option<&Value>,
+    settings: &AppSettings,
+    warnings: &mut Vec<String>,
+) -> Vec<SyncRule> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| parse_rule(item, index, settings, warnings))
+            .collect(),
+        Some(_) => {
+            let message = "规则列表格式异常，已标记为损坏规则。".to_string();
+            warnings.push(message.clone());
+            vec![build_invalid_rule(
+                None,
+                Some("已损坏的规则配置".to_string()),
+                RuleKind::File,
+                None,
+                None,
+                true,
+                false,
+                false,
+                false,
+                settings.default_poll_interval_sec,
+                Vec::new(),
+                Vec::new(),
+                None,
+                RuleLastResult::default(),
+                vec![message],
+            )]
+        }
+        None => Vec::new(),
+    }
+}
+
+fn parse_rule(
+    value: &Value,
+    index: usize,
+    settings: &AppSettings,
+    warnings: &mut Vec<String>,
+) -> SyncRule {
+    let Some(object) = value.as_object() else {
+        let message = format!("第 {} 条规则不是有效对象，已标记为异常。", index + 1);
+        warnings.push(message.clone());
+        return build_invalid_rule(
+            None,
+            Some(format!("异常规则 {}", index + 1)),
+            RuleKind::File,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+            settings.default_poll_interval_sec,
+            Vec::new(),
+            Vec::new(),
+            None,
+            RuleLastResult::default(),
+            vec![message],
+        );
+    };
+
+    let mut issues = Vec::new();
+    let id = read_string_field(object, "id", &mut issues)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            issues.push("缺少规则 ID，已重新生成。".to_string());
+            Uuid::new_v4().to_string()
+        });
+    let name = read_string_field(object, "name", &mut issues)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            issues.push("缺少规则名称，已使用默认名称。".to_string());
+            format!("异常规则 {}", index + 1)
+        });
+    let kind = parse_rule_kind(read_string_field(object, "kind", &mut issues), &mut issues);
+    let source_path = read_string_field(object, "sourcePath", &mut issues).unwrap_or_default();
+    if source_path.trim().is_empty() {
+        issues.push("源路径缺失。".to_string());
+    }
+    let target_path = read_string_field(object, "targetPath", &mut issues).unwrap_or_default();
+    if target_path.trim().is_empty() {
+        issues.push("目标路径缺失。".to_string());
+    }
+    let enabled = read_bool_field(object, "enabled", true, &mut issues);
+    let bidirectional = read_bool_field(object, "bidirectional", false, &mut issues);
+    let auto_sync = read_bool_field(object, "autoSync", true, &mut issues);
+    let watch_enabled = read_bool_field(object, "watchEnabled", true, &mut issues);
+    let poll_fallback_enabled = read_bool_field(object, "pollFallbackEnabled", true, &mut issues);
+    let poll_interval_sec = read_u64_field(
+        object,
+        "pollIntervalSec",
+        settings.default_poll_interval_sec.max(5),
+        &mut issues,
+    )
+    .max(5);
+    let include_globs = read_string_array_field(object, "includeGlobs", &mut issues);
+    let exclude_globs = read_string_array_field(object, "excludeGlobs", &mut issues);
+    let sync_state = parse_sync_state(object.get("syncState"), &mut issues);
+    let last_sync_at = read_optional_string_field(object, "lastSyncAt", &mut issues);
+    let mut last_result = parse_last_result(object.get("lastResult"), &mut issues);
+    let delete_policy = sync_engine::default_delete_policy(kind.clone(), bidirectional);
+
+    if issues.is_empty() {
+        return SyncRule {
+            id,
+            name,
+            enabled,
+            kind,
+            source_path,
+            target_path,
+            bidirectional,
+            auto_sync,
+            watch_enabled,
+            poll_fallback_enabled,
+            poll_interval_sec,
+            conflict_policy: crate::models::ConflictPolicy::OverwriteWithBackup,
+            delete_policy,
+            include_globs,
+            exclude_globs,
+            sync_state,
+            last_sync_at,
+            last_result,
+            health: RuleHealth::Healthy,
+            config_error: None,
+        };
+    }
+
+    let issue_text = issues.join(" ");
+    warnings.push(format!(
+        "规则“{}”存在配置异常，已按异常规则加载。{}",
+        name, issue_text
+    ));
+    if last_result.message.trim().is_empty() {
+        last_result.message = format!("规则配置异常：{issue_text}");
+    } else {
+        last_result.message = format!("{} | 配置异常：{issue_text}", last_result.message);
+    }
+    last_result.success = false;
+    last_result.error_count = last_result.error_count.max(1);
+
+    build_invalid_rule(
+        Some(id),
+        Some(name),
+        kind,
+        if source_path.trim().is_empty() {
+            None
+        } else {
+            Some(source_path)
+        },
+        if target_path.trim().is_empty() {
+            None
+        } else {
+            Some(target_path)
+        },
+        enabled,
+        bidirectional,
+        auto_sync,
+        poll_fallback_enabled,
+        poll_interval_sec,
+        include_globs,
+        exclude_globs,
+        last_sync_at,
+        last_result,
+        issues,
+    )
+}
+
+fn parse_history(value: Option<&Value>, warnings: &mut Vec<String>) -> Vec<SyncHistoryItem> {
+    match value {
+        Some(Value::Array(items)) => {
+            let mut history = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                match serde_json::from_value::<SyncHistoryItem>(item.clone()) {
+                    Ok(entry) => history.push(entry),
+                    Err(error) => warnings.push(format!(
+                        "第 {} 条历史记录格式异常，已跳过：{}",
+                        index + 1,
+                        error
+                    )),
+                }
+            }
+            history
+        }
+        Some(_) => {
+            warnings.push("同步历史格式异常，已重置为空。".to_string());
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+fn read_string_field(
+    object: &Map<String, Value>,
+    key: &str,
+    issues: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(key) {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Null) => None,
+        Some(_) => {
+            issues.push(format!("字段“{}”不是字符串。", key));
+            None
+        }
+        None => None,
+    }
+}
+
+fn read_optional_string_field(
+    object: &Map<String, Value>,
+    key: &str,
+    issues: &mut Vec<String>,
+) -> Option<String> {
+    read_string_field(object, key, issues).filter(|value| !value.trim().is_empty())
+}
+
+fn read_bool_field(
+    object: &Map<String, Value>,
+    key: &str,
+    default: bool,
+    issues: &mut Vec<String>,
+) -> bool {
+    match object.get(key) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) => default,
+        Some(_) => {
+            issues.push(format!("字段“{}”不是布尔值。", key));
+            default
+        }
+        None => default,
+    }
+}
+
+fn read_u64_field(
+    object: &Map<String, Value>,
+    key: &str,
+    default: u64,
+    issues: &mut Vec<String>,
+) -> u64 {
+    match object.get(key) {
+        Some(Value::Number(value)) => value.as_u64().unwrap_or_else(|| {
+            issues.push(format!("字段“{}”不是正整数。", key));
+            default
+        }),
+        Some(Value::Null) => default,
+        Some(_) => {
+            issues.push(format!("字段“{}”不是数字。", key));
+            default
+        }
+        None => default,
+    }
+}
+
+fn read_string_array_field(
+    object: &Map<String, Value>,
+    key: &str,
+    issues: &mut Vec<String>,
+) -> Vec<String> {
+    match object.get(key) {
+        Some(Value::Array(items)) => {
+            let mut result = Vec::new();
+            let mut invalid_count = 0usize;
+            for item in items {
+                match item {
+                    Value::String(value) => {
+                        let trimmed = value.trim();
+                        if !trimmed.is_empty() {
+                            result.push(trimmed.to_string());
+                        }
+                    }
+                    Value::Null => {}
+                    _ => invalid_count += 1,
+                }
+            }
+            if invalid_count > 0 {
+                issues.push(format!(
+                    "字段“{}”中有 {} 项不是字符串，已忽略。",
+                    key, invalid_count
+                ));
+            }
+            result
+        }
+        Some(Value::Null) => Vec::new(),
+        Some(_) => {
+            issues.push(format!("字段“{}”不是字符串数组。", key));
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+fn parse_rule_kind(raw_kind: Option<String>, issues: &mut Vec<String>) -> RuleKind {
+    match raw_kind.as_deref() {
+        Some("file") => RuleKind::File,
+        Some("folder") => RuleKind::Folder,
+        Some(other) => {
+            issues.push(format!("规则类型“{}”无效，已按文件规则载入。", other));
+            RuleKind::File
+        }
+        None => {
+            issues.push("缺少规则类型，已按文件规则载入。".to_string());
+            RuleKind::File
+        }
+    }
+}
+
+fn parse_last_result(value: Option<&Value>, issues: &mut Vec<String>) -> RuleLastResult {
+    match value {
+        Some(raw) => {
+            serde_json::from_value::<RuleLastResult>(raw.clone()).unwrap_or_else(|error| {
+                issues.push(format!("最近一次同步结果格式异常，已重置：{error}"));
+                RuleLastResult::default()
+            })
+        }
+        None => RuleLastResult::default(),
+    }
+}
+
+fn parse_sync_state(value: Option<&Value>, issues: &mut Vec<String>) -> RuleSyncState {
+    match value {
+        Some(raw) => serde_json::from_value::<RuleSyncState>(raw.clone()).unwrap_or_else(|error| {
+            issues.push(format!("同步清单格式异常，已重置：{error}"));
+            RuleSyncState::default()
+        }),
+        None => RuleSyncState::default(),
+    }
+}
+
+fn build_invalid_rule(
+    id: Option<String>,
+    name: Option<String>,
+    kind: RuleKind,
+    source_path: Option<String>,
+    target_path: Option<String>,
+    enabled: bool,
+    bidirectional: bool,
+    auto_sync: bool,
+    poll_fallback_enabled: bool,
+    poll_interval_sec: u64,
+    include_globs: Vec<String>,
+    exclude_globs: Vec<String>,
+    last_sync_at: Option<String>,
+    mut last_result: RuleLastResult,
+    issues: Vec<String>,
+) -> SyncRule {
+    let issue_text = issues.join(" ");
+    if last_result.message.trim().is_empty() {
+        last_result.message = format!("规则配置异常：{issue_text}");
+    }
+    last_result.success = false;
+    last_result.error_count = last_result.error_count.max(1);
+    let delete_policy = sync_engine::default_delete_policy(kind.clone(), bidirectional);
+
+    SyncRule {
+        id: id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        name: name.unwrap_or_else(|| "已损坏的规则配置".to_string()),
+        enabled,
+        kind,
+        source_path: source_path.unwrap_or_default(),
+        target_path: target_path.unwrap_or_default(),
+        bidirectional,
+        auto_sync,
+        watch_enabled: false,
+        poll_fallback_enabled,
+        poll_interval_sec: poll_interval_sec.max(5),
+        conflict_policy: crate::models::ConflictPolicy::OverwriteWithBackup,
+        delete_policy,
+        include_globs,
+        exclude_globs,
+        sync_state: RuleSyncState::default(),
+        last_sync_at,
+        last_result,
+        health: RuleHealth::InvalidConfiguration,
+        config_error: Some(issue_text),
+    }
+}
+
+fn backup_store_file(store_path: &Path) -> Result<PathBuf, String> {
+    let backup_path = store_path.with_file_name(format!(
+        "store.corrupt.{}.json",
+        Utc::now().timestamp_millis()
+    ));
+    fs::copy(store_path, &backup_path).map_err(|error| error.to_string())?;
+    Ok(backup_path)
 }
 
 fn save_store(app: &AppHandle<Wry>, store: &PersistedStore) -> Result<(), String> {
@@ -674,4 +1304,92 @@ fn clear_logs(app: &AppHandle<Wry>) -> Result<(), String> {
         fs::remove_file(path).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_watcher_failures_to_rules, deserialize_store_lossy};
+
+    #[test]
+    fn deserialize_store_marks_invalid_rules_without_failing() {
+        let content = r#"
+        {
+          "settings": {
+            "launchOnStartup": false,
+            "startMinimizedToTray": false,
+            "closeToTray": true,
+            "theme": "light",
+            "showNotifications": true,
+            "defaultPollIntervalSec": 300,
+            "backupRetentionDays": 30
+          },
+          "rules": [
+            {
+              "id": "broken-rule",
+              "name": "损坏规则",
+              "enabled": true,
+              "kind": "mystery",
+              "sourcePath": "C:\\\\source.txt",
+              "targetPath": "C:\\\\target.txt",
+              "autoSync": true,
+              "watchEnabled": true,
+              "pollFallbackEnabled": true,
+              "pollIntervalSec": 60,
+              "includeGlobs": [],
+              "excludeGlobs": []
+            }
+          ],
+          "history": []
+        }
+        "#;
+
+        let outcome = deserialize_store_lossy(content);
+
+        assert!(outcome.repaired);
+        assert_eq!(outcome.store.rules.len(), 1);
+        assert_eq!(
+            outcome.store.rules[0].health,
+            crate::models::RuleHealth::InvalidConfiguration
+        );
+        assert!(outcome.store.rules[0].config_error.is_some());
+    }
+
+    #[test]
+    fn deserialize_store_recovers_from_invalid_json() {
+        let outcome = deserialize_store_lossy("{ not-json");
+
+        assert!(outcome.repaired);
+        assert_eq!(outcome.store.rules.len(), 1);
+        assert_eq!(
+            outcome.store.rules[0].health,
+            crate::models::RuleHealth::InvalidConfiguration
+        );
+        assert!(
+            outcome.store.rules[0]
+                .last_result
+                .message
+                .contains("无法解析")
+        );
+    }
+
+    #[test]
+    fn watcher_failures_only_mark_rule_unavailable() {
+        let mut rule = crate::models::SyncRule::default();
+        rule.id = "rule-1".to_string();
+        rule.name = "示例规则".to_string();
+
+        let mut rules = vec![rule];
+        let failures = std::collections::HashMap::from([(
+            "rule-1".to_string(),
+            "监听不可用：Access is denied.".to_string(),
+        )]);
+
+        apply_watcher_failures_to_rules(&mut rules, &failures);
+
+        assert_eq!(rules[0].health, crate::models::RuleHealth::WatchUnavailable);
+        assert_eq!(
+            rules[0].config_error.as_deref(),
+            Some("监听不可用：Access is denied.")
+        );
+    }
 }
